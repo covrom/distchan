@@ -1,6 +1,7 @@
 package distchan_test
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -51,12 +52,12 @@ func TestDistchan(t *testing.T) {
 }
 
 func Encrypter(key []byte) distchan.Transformer {
-	return func(plaintext []byte) []byte {
+	return func(buf io.Reader) io.Reader {
 		block, err := aes.NewCipher(key)
 		if err != nil {
 			panic(err)
 		}
-
+		plaintext, _ := ioutil.ReadAll(buf)
 		ciphertext := make([]byte, aes.BlockSize+len(plaintext))
 		iv := ciphertext[:aes.BlockSize]
 		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
@@ -66,17 +67,17 @@ func Encrypter(key []byte) distchan.Transformer {
 		stream := cipher.NewCFBEncrypter(block, iv)
 		stream.XORKeyStream(ciphertext[aes.BlockSize:], plaintext)
 
-		return ciphertext
+		return bytes.NewReader(ciphertext)
 	}
 }
 
 func Decrypter(key []byte) distchan.Transformer {
-	return func(ciphertext []byte) []byte {
+	return func(buf io.Reader) io.Reader {
 		block, err := aes.NewCipher(key)
 		if err != nil {
 			panic(err)
 		}
-
+		ciphertext,_ := ioutil.ReadAll(buf)
 		if len(ciphertext) < aes.BlockSize {
 			panic("ciphertext too short")
 		}
@@ -86,7 +87,7 @@ func Decrypter(key []byte) distchan.Transformer {
 		stream := cipher.NewCFBDecrypter(block, iv)
 		stream.XORKeyStream(ciphertext, ciphertext)
 
-		return ciphertext
+		return bytes.NewReader(ciphertext)
 	}
 }
 

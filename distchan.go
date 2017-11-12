@@ -165,9 +165,13 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 	var (
 		buf  = getBuffer()
 		dec  = gob.NewDecoder(&buf)
-		et   = reflect.TypeOf(s.inv).Elem()
+		et   reflect.Type
 		done = make(chan struct{})
 	)
+
+	if s.inv != nil {
+		et = reflect.TypeOf(s.inv).Elem()
+	}
 
 	defer close(done)
 
