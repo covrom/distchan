@@ -10,18 +10,27 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 func TestDistchan(t *testing.T) {
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "localhost:9450")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	sch := make(chan string)
-	server := distchan.NewServer(ln, sch, nil)
+	server, _ := distchan.NewServer(ln, sch, nil)
 	server.Start()
+
+	conn, err := net.Dial(ln.Addr().Network(), ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inCh := make(chan string)
+	cli, _ := distchan.NewClient(conn, nil, inCh)
+	cli.Start()
 
 	go func() {
 		sch <- "why"
@@ -30,14 +39,6 @@ func TestDistchan(t *testing.T) {
 		sch <- "world"
 		close(sch)
 	}()
-
-	conn, err := net.Dial(ln.Addr().Network(), ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	inCh := make(chan string)
-	distchan.NewClient(conn, nil, inCh).Start()
 
 	var received []string
 	for msg := range inCh {
@@ -90,13 +91,13 @@ func Decrypter(key []byte) distchan.Transformer {
 }
 
 func TestEncryptionSuccess(t *testing.T) {
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "localhost:9450")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	sch := make(chan string)
-	server := distchan.NewServer(ln, sch, nil)
+	server, _ := distchan.NewServer(ln, sch, nil)
 	server.AddEncoder(Encrypter([]byte("the-key-has-to-be-32-bytes-long!")))
 	server.Start()
 
@@ -114,7 +115,7 @@ func TestEncryptionSuccess(t *testing.T) {
 	}
 
 	inCh := make(chan string)
-	client := distchan.NewClient(conn, nil, inCh)
+	client, _ := distchan.NewClient(conn, nil, inCh)
 	client.AddDecoder(Decrypter([]byte("the-key-has-to-be-32-bytes-long!")))
 	client.Start()
 
@@ -129,13 +130,13 @@ func TestEncryptionSuccess(t *testing.T) {
 }
 
 func TestEncryptionFailure(t *testing.T) {
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "localhost:9450")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	sch := make(chan string)
-	server := distchan.NewServer(ln, sch, nil)
+	server, _ := distchan.NewServer(ln, sch, nil)
 	server.AddEncoder(Encrypter([]byte("the-key-has-to-be-32-bytes-long!")))
 	server.Start()
 
@@ -153,7 +154,7 @@ func TestEncryptionFailure(t *testing.T) {
 	}
 
 	inCh := make(chan string)
-	client := distchan.NewClient(conn, nil, inCh)
+	client, _ := distchan.NewClient(conn, nil, inCh)
 	client.Logger().SetOutput(ioutil.Discard)
 	// Note that the key here is different.
 	client.AddDecoder(Decrypter([]byte("the-key-has-to-be-32-bytes-long?")))
