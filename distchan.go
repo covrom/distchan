@@ -62,7 +62,7 @@ func NewServer(ln net.Listener, out, in interface{}) (*Server, error) {
 		closed:  make(chan struct{}),
 		done:    make(chan struct{}),
 		logger:  log.New(os.Stdout, "[distchan] ", log.Lshortfile),
-		chconn:  make(chan clientConn, 100),
+		chconn:  make(chan clientConn),
 		chbroad: make(chan net.Conn), //non-buffered
 	}, nil
 }
@@ -187,7 +187,7 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 			if err := binary.Write(c, binary.LittleEndian, int32(-1)); err != nil {
 				s.logger.Println(err)
 			}
-			c.Close()
+			// c.Close()
 			<-d
 		case <-d:
 		}
@@ -201,6 +201,8 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 		for {
 			select {
 			case <-d:
+				// close(s.chbroad)
+				s.chbroad <- c
 				return
 			case s.chbroad <- c:
 				// push client connection in broadcast queue
@@ -265,13 +267,10 @@ func (s *Server) handleOutgoingMessages() {
 			continue
 		}
 
-		bb := getBuffer() // for use in goroutines
-		io.Copy(&bb, &buf)
-
 		for _, encoder := range s.encoders {
-			ec := encoder(&bb)
-			bb.Reset()
-			if _, err := io.Copy(&bb, ec); err != nil {
+			ec := encoder(&buf)
+			buf.Reset()
+			if _, err := io.Copy(&buf, ec); err != nil {
 				s.logger.Panicln(err)
 			}
 		}
@@ -280,18 +279,19 @@ func (s *Server) handleOutgoingMessages() {
 
 		for i := int32(0); i < atomic.LoadInt32(&s.conncnt); {
 			select {
-			case <-s.closed:
-				break
-			case c := <-s.chbroad:
-				// we need only different connections
-				if _, ok := seen[c]; !ok {
-					seen[c] = true
-					go func(cn net.Conn, bts bytes.Buffer) {
-						if err := writeChunk(cn, &bts, bts.Len()); err != nil {
+			// case <-s.closed:
+			// 	break
+			case c, ok := <-s.chbroad:
+				if ok {
+					// we need only different connections
+					if _, ok := seen[c]; !ok {
+						seen[c] = true
+						bts := buf
+						if err := writeChunk(c, &bts, bts.Len()); err != nil {
 							s.logger.Println(err)
 						}
-					}(c, bb)
-					i++
+						i++
+					}
 				}
 			}
 		}
