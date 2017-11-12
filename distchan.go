@@ -20,6 +20,7 @@ import (
 var (
 	ErrorInIsNotChannel  = errors.New("Parameter 'in' is not a channel")
 	ErrorOutIsNotChannel = errors.New("Parameter 'out' is not a channel")
+	ErrorBadRequest      = errors.New("Bad request format")
 )
 
 // sync.Pool for connection buffers
@@ -82,8 +83,6 @@ type Server struct {
 
 type clientConn struct {
 	c net.Conn
-	// buf bytes.Buffer
-	// enc *gob.Encoder
 }
 
 // Start instructs the server to begin serving messages.
@@ -158,9 +157,7 @@ func (s *Server) handleIncomingConnections() {
 	}()
 
 	for cc := range s.chconn {
-		if s.inv != nil {
-			go s.handleIncomingMessages(cc)
-		}
+		go s.handleIncomingMessages(cc)
 	}
 }
 
@@ -180,6 +177,9 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 		// wait for closing and send close to client
 		select {
 		case <-s.closed:
+			if err := binary.Write(c, binary.LittleEndian, signature); err != nil {
+				s.logger.Println(err)
+			}
 			if err := binary.Write(c, binary.LittleEndian, int32(-1)); err != nil {
 				s.logger.Println(err)
 			}
@@ -207,7 +207,7 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 	for {
 		buf.Reset()
 
-		b, err := readChunk(conn.c)
+		err := readChunk(&buf, conn.c)
 		if err != nil {
 			if err != io.EOF {
 				s.logger.Println(err)
@@ -215,22 +215,26 @@ func (s *Server) handleIncomingMessages(conn clientConn) {
 			break
 		}
 
-		for _, decoder := range s.decoders {
-			b = decoder(b)
-		}
-		if _, err := buf.Write(b); err != nil {
-			s.logger.Panicln(err)
-		}
+		if s.inv != nil {
 
-		x := reflect.New(et)
-		if err := dec.DecodeValue(x); err != nil {
-			if err == io.EOF {
-				break
+			for _, decoder := range s.decoders {
+				dc := decoder(&buf)
+				buf.Reset()
+				if _, err = io.Copy(&buf, dc); err != nil {
+					s.logger.Panicln(err)
+				}
 			}
-			s.logger.Panicln(err)
-		}
 
-		reflect.ValueOf(s.inv).Send(x.Elem())
+			x := reflect.New(et)
+			if err := dec.DecodeValue(x); err != nil {
+				if err == io.EOF {
+					break
+				}
+				s.logger.Panicln(err)
+			}
+
+			reflect.ValueOf(s.inv).Send(x.Elem())
+		}
 	}
 
 	if buf.Cap() <= 1<<22 {
@@ -245,23 +249,27 @@ func (s *Server) handleOutgoingMessages() {
 	)
 
 	for {
+		buf.Reset()
+
 		x, ok := reflect.ValueOf(s.outv).Recv()
 		if !ok {
 			break
 		}
-
-		buf.Reset()
 
 		if err := enc.EncodeValue(x); err != nil {
 			s.logger.Println(err)
 			continue
 		}
 
-		bb := make([]byte, 0, buf.Len()) // for use in goroutines
-		copy(bb, buf.Bytes())
+		bb := getBuffer() // for use in goroutines
+		io.Copy(&bb, &buf)
 
 		for _, encoder := range s.encoders {
-			bb = encoder(bb)
+			ec := encoder(&bb)
+			bb.Reset()
+			if _, err := io.Copy(&bb, ec); err != nil {
+				s.logger.Panicln(err)
+			}
 		}
 
 		seen := make(map[net.Conn]bool)
@@ -274,8 +282,8 @@ func (s *Server) handleOutgoingMessages() {
 				// we need only different connections
 				if _, ok := seen[c]; !ok {
 					seen[c] = true
-					go func(cn net.Conn, bts []byte) {
-						if err := writeChunk(cn, bts); err != nil {
+					go func(cn net.Conn, bts bytes.Buffer) {
+						if err := writeChunk(cn, &bts, bts.Len()); err != nil {
 							s.logger.Println(err)
 						}
 					}(c, bb)
@@ -287,6 +295,10 @@ func (s *Server) handleOutgoingMessages() {
 
 	if err := s.ln.Close(); err != nil {
 		s.logger.Printf("error closing listener: %s\n", err)
+	}
+
+	if buf.Cap() <= 1<<22 {
+		putBuffer(buf)
 	}
 }
 
@@ -309,7 +321,7 @@ func NewClient(conn net.Conn, out, in interface{}) (*Client, error) {
 // Transformer represents a function that does an arbitrary transformation
 // on a piece of data. It's used for defining custom encoders and decoders
 // for modifying how data is sent across the wire.
-type Transformer func([]byte) []byte
+type Transformer func(src io.Reader) io.Reader
 
 // Client represents a registration between a network connection and a pair
 // of channels. See the documentation for Server for more details.
@@ -387,7 +399,9 @@ func (c *Client) handleIncomingMessages() {
 	}()
 
 	for {
-		b, err := readChunk(c.conn)
+		buf.Reset()
+
+		err := readChunk(&buf, c.conn)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -396,10 +410,11 @@ func (c *Client) handleIncomingMessages() {
 		}
 
 		for _, decoder := range c.decoders {
-			b = decoder(b)
-		}
-		if _, err := buf.Write(b); err != nil {
-			panic(err)
+			dc := decoder(&buf)
+			buf.Reset()
+			if _, err = io.Copy(&buf, dc); err != nil {
+				c.logger.Panicln(err)
+			}
 		}
 
 		x := reflect.New(et)
@@ -410,7 +425,6 @@ func (c *Client) handleIncomingMessages() {
 			panic(err)
 		}
 
-		buf.Reset()
 		reflect.ValueOf(c.inv).Send(x.Elem())
 	}
 
@@ -426,6 +440,8 @@ func (c *Client) handleOutgoingMessages() {
 	)
 
 	for {
+		buf.Reset()
+
 		x, ok := reflect.ValueOf(c.outv).Recv()
 		if !ok {
 			break
@@ -434,14 +450,15 @@ func (c *Client) handleOutgoingMessages() {
 			c.logger.Panicln(err)
 		}
 
-		b := buf.Bytes()
-		buf.Reset()
-
 		for _, encoder := range c.encoders {
-			b = encoder(b)
+			ec := encoder(&buf)
+			buf.Reset()
+			if _, err := io.Copy(&buf, ec); err != nil {
+				c.logger.Panicln(err)
+			}
 		}
 
-		if err := writeChunk(c.conn, b); err != nil {
+		if err := writeChunk(c.conn, &buf, buf.Len()); err != nil {
 			c.logger.Printf("error writing value to connection: %s\n", err)
 		}
 	}
@@ -453,29 +470,41 @@ func (c *Client) handleOutgoingMessages() {
 	close(c.done)
 }
 
-func readChunk(r io.Reader) ([]byte, error) {
+var signature int32 = 0x7f38b034 // protecting from bad incoming data
+
+func readChunk(buf io.Writer, r io.Reader) error {
 	var n int32
 	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
-		return nil, err
+		return err
+	}
+
+	if n != signature {
+		return ErrorBadRequest
+	}
+
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return err
 	}
 
 	if n == -1 {
-		return nil, io.EOF
+		return io.EOF
 	}
 
-	b := make([]byte, n)
-	if _, err := io.ReadFull(r, b); err != nil {
-		return nil, err
-	}
-
-	return b, nil
-}
-
-func writeChunk(w io.Writer, b []byte) error {
-	if err := binary.Write(w, binary.LittleEndian, int32(len(b))); err != nil {
+	if _, err := io.CopyN(buf, r, int64(n)); err != nil {
 		return err
 	}
-	if _, err := w.Write(b); err != nil {
+
+	return nil
+}
+
+func writeChunk(w io.Writer, buf io.Reader, lenbuf int) error {
+	if err := binary.Write(w, binary.LittleEndian, signature); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, int32(lenbuf)); err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, buf); err != nil {
 		return err
 	}
 	return nil
