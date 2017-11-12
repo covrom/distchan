@@ -266,11 +266,12 @@ func (s *Server) handleOutgoingMessages() {
 
 		seen := make(map[net.Conn]bool)
 
-		for i := int32(0); i < atomic.LoadInt32(&s.conncnt); i++ {
+		for i := int32(0); i < atomic.LoadInt32(&s.conncnt); {
 			select {
 			case <-s.closed:
 				break
 			case c := <-s.chbroad:
+				// we need only different connections
 				if _, ok := seen[c]; !ok {
 					seen[c] = true
 					go func(cn net.Conn, bts []byte) {
@@ -278,6 +279,7 @@ func (s *Server) handleOutgoingMessages() {
 							s.logger.Println(err)
 						}
 					}(c, bb)
+					i++
 				}
 			}
 		}
@@ -288,14 +290,20 @@ func (s *Server) handleOutgoingMessages() {
 	}
 }
 
-func NewClient(conn net.Conn, out, in interface{}) *Client {
+func NewClient(conn net.Conn, out, in interface{}) (*Client, error) {
+	if in != nil && reflect.ValueOf(in).Kind() != reflect.Chan {
+		return nil, ErrorInIsNotChannel
+	}
+	if out != nil && reflect.ValueOf(out).Kind() != reflect.Chan {
+		return nil, ErrorOutIsNotChannel
+	}
 	return &Client{
 		conn:   conn,
-		outv:   reflect.ValueOf(out),
-		inv:    reflect.ValueOf(in),
+		outv:   out,
+		inv:    in,
 		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
 		done:   make(chan struct{}),
-	}
+	}, nil
 }
 
 // Transformer represents a function that does an arbitrary transformation
@@ -307,7 +315,7 @@ type Transformer func([]byte) []byte
 // of channels. See the documentation for Server for more details.
 type Client struct {
 	conn               net.Conn
-	inv, outv          reflect.Value
+	inv, outv          interface{}
 	encoders, decoders []Transformer
 	started            bool
 	logger             *log.Logger
@@ -334,10 +342,10 @@ func (c *Client) AddDecoder(f Transformer) *Client {
 
 // Start instructs the client to begin serving messages.
 func (c *Client) Start() *Client {
-	if c.inv != (reflect.Value{}) {
+	if c.inv != nil {
 		go c.handleIncomingMessages()
 	}
-	if c.outv != (reflect.Value{}) {
+	if c.outv != nil {
 		go c.handleOutgoingMessages()
 	}
 	c.started = true
@@ -363,11 +371,11 @@ func (c *Client) handleIncomingMessages() {
 		// The gob decoder uses a buffer because its underlying reader
 		// can't change without running into an "unknown type id" error.
 		dec = gob.NewDecoder(&buf)
-		et  = c.inv.Type().Elem()
+		et  = reflect.TypeOf(c.inv).Elem()
 	)
 
 	defer func() {
-		c.inv.Close()
+		reflect.ValueOf(c.inv).Close()
 
 		// A panic can happen if the underlying channel was closed
 		// and we tried to send on it, or if there was a decryption
@@ -403,7 +411,11 @@ func (c *Client) handleIncomingMessages() {
 		}
 
 		buf.Reset()
-		c.inv.Send(x.Elem())
+		reflect.ValueOf(c.inv).Send(x.Elem())
+	}
+
+	if buf.Cap() <= 1<<22 {
+		putBuffer(buf)
 	}
 }
 
@@ -414,7 +426,7 @@ func (c *Client) handleOutgoingMessages() {
 	)
 
 	for {
-		x, ok := c.outv.Recv()
+		x, ok := reflect.ValueOf(c.outv).Recv()
 		if !ok {
 			break
 		}
@@ -432,6 +444,10 @@ func (c *Client) handleOutgoingMessages() {
 		if err := writeChunk(c.conn, b); err != nil {
 			c.logger.Printf("error writing value to connection: %s\n", err)
 		}
+	}
+
+	if buf.Cap() <= 1<<22 {
+		putBuffer(buf)
 	}
 
 	close(c.done)
