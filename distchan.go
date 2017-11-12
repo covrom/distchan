@@ -4,14 +4,39 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
 	"reflect"
+	"runtime"
 	"sync"
-	"time"
+	"sync/atomic"
 )
+
+// ErrorInIsNotChannel raises when 'in' is not nil and not a channel
+// ErrorOutIsNotChannel raises when 'out' is not nil and not a channel
+var (
+	ErrorInIsNotChannel  = errors.New("Parameter 'in' is not a channel")
+	ErrorOutIsNotChannel = errors.New("Parameter 'out' is not a channel")
+)
+
+// sync.Pool for connection buffers
+var bufPool = sync.Pool{}
+
+func getBuffer() bytes.Buffer {
+	b := bufPool.Get()
+	if b != nil {
+		return b.(bytes.Buffer)
+	}
+	return bytes.Buffer{}
+}
+
+func putBuffer(b bytes.Buffer) {
+	b.Reset()
+	bufPool.Put(b)
+}
 
 // NewServer registers a pair of channels with an active listener. Gob-encoded
 // messages received on the listener will be passed to in; any values passed to
@@ -22,43 +47,59 @@ import (
 // Note that the returned value's Start() method must be called before any
 // messages will be passed. This gives the user an opportunity to register
 // encoders and decoders before any data passes over the network.
-func NewServer(ln net.Listener, out, in interface{}) *Server {
-	return &Server{
-		ln:     ln,
-		outv:   reflect.ValueOf(out),
-		inv:    reflect.ValueOf(in),
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
-		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+func NewServer(ln net.Listener, out, in interface{}) (*Server, error) {
+	if in != nil && reflect.ValueOf(in).Kind() != reflect.Chan {
+		return nil, ErrorInIsNotChannel
 	}
+	if out != nil && reflect.ValueOf(out).Kind() != reflect.Chan {
+		return nil, ErrorOutIsNotChannel
+	}
+	return &Server{
+		ln:      ln,
+		outv:    out,
+		inv:     in,
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+		logger:  log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+		chconn:  make(chan clientConn, 100),
+		chbroad: make(chan net.Conn), //non-buffered
+	}, nil
 }
 
 // Server represents a registration between a network listener and a pair
 // of channels, one for input and one for output.
 type Server struct {
 	ln                 net.Listener
-	inv, outv          reflect.Value
+	inv, outv          interface{}
 	mu                 sync.RWMutex
-	connections        []*clientConn
+	chconn             chan clientConn
+	conncnt            int32
+	chbroad            chan net.Conn
 	encoders, decoders []Transformer
-	i                  int
 	closed, done       chan struct{}
 	logger             *log.Logger
 }
 
 type clientConn struct {
-	c   net.Conn
-	buf *bytes.Buffer
-	enc *gob.Encoder
+	c net.Conn
+	// buf bytes.Buffer
+	// enc *gob.Encoder
 }
 
 // Start instructs the server to begin serving messages.
 func (s *Server) Start() *Server {
 	go s.handleIncomingConnections()
-	if s.outv != (reflect.Value{}) {
+	if s.outv != nil {
 		go s.handleOutgoingMessages()
 	}
 	return s
+}
+
+// Stop instructs the server to stop serving messages.
+func (s *Server) Stop() {
+	if err := s.ln.Close(); err != nil {
+		s.logger.Printf("error closing listener: %s\n", err)
+	}
 }
 
 // AddEncoder adds a new encoder to the server. Any outbound messages
@@ -81,17 +122,14 @@ func (s *Server) AddDecoder(f Transformer) *Server {
 
 // Ready returns true if there are any clients currently connected.
 func (s *Server) Ready() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.connections) > 0
+	return atomic.LoadInt32(&s.conncnt) > 0
 }
 
 // WaitUntilReady blocks until the server has at least one client available.
 func (s *Server) WaitUntilReady() {
 	for {
-		time.Sleep(1 * time.Second)
+		runtime.Gosched()
 		if s.Ready() {
-			s.i = 0
 			return
 		}
 	}
@@ -105,60 +143,70 @@ func (s *Server) Logger() *log.Logger {
 }
 
 func (s *Server) handleIncomingConnections() {
-	newConns := make(chan net.Conn)
 	go func() {
 		for {
 			conn, err := s.ln.Accept()
 			if err != nil {
 				// for now, assume it's a "use of closed network connection" error
-				break
+				close(s.closed)
+				close(s.chconn)
+				return
 			}
-			newConns <- conn
+			cc := clientConn{c: conn}
+			s.chconn <- cc
 		}
-		close(s.closed)
 	}()
 
-	for {
-		select {
-		case <-s.closed:
-			s.mu.RLock()
-			for _, conn := range s.connections {
-				if err := binary.Write(conn.c, binary.LittleEndian, int32(-1)); err != nil {
-					s.logger.Println(err)
-				}
-			}
-			s.mu.RUnlock()
-
-			for {
-				s.mu.RLock()
-				if len(s.connections) == 0 {
-					s.inv.Close()
-					return
-				}
-				s.mu.RUnlock()
-				time.Sleep(500 * time.Millisecond)
-			}
-
-		case c := <-newConns:
-			s.mu.Lock()
-			conn := &clientConn{c: c, buf: new(bytes.Buffer)}
-			s.connections = append(s.connections, conn)
-			if s.inv != (reflect.Value{}) {
-				go s.handleIncomingMessages(conn)
-			}
-			s.mu.Unlock()
+	for cc := range s.chconn {
+		if s.inv != nil {
+			go s.handleIncomingMessages(cc)
 		}
 	}
 }
 
-func (s *Server) handleIncomingMessages(conn *clientConn) {
+func (s *Server) handleIncomingMessages(conn clientConn) {
 	var (
-		buf bytes.Buffer
-		dec = gob.NewDecoder(&buf)
-		et  = s.inv.Type().Elem()
+		buf  = getBuffer()
+		dec  = gob.NewDecoder(&buf)
+		et   = reflect.TypeOf(s.inv).Elem()
+		done = make(chan struct{})
 	)
 
+	defer close(done)
+
+	atomic.AddInt32(&s.conncnt, 1)
+
+	go func(c net.Conn, d chan struct{}) {
+		// wait for closing and send close to client
+		select {
+		case <-s.closed:
+			if err := binary.Write(c, binary.LittleEndian, int32(-1)); err != nil {
+				s.logger.Println(err)
+			}
+			c.Close()
+			<-d
+		case <-d:
+		}
+
+		atomic.AddInt32(&s.conncnt, -1)
+
+	}(conn.c, done)
+
+	go func(c net.Conn, d chan struct{}) {
+		// wait for broadcasting and send it to client
+		for {
+			select {
+			case <-d:
+				return
+			case s.chbroad <- c:
+				// push client connection in broadcast queue
+			}
+		}
+	}(conn.c, done)
+
 	for {
+		buf.Reset()
+
 		b, err := readChunk(conn.c)
 		if err != nil {
 			if err != io.EOF {
@@ -182,88 +230,56 @@ func (s *Server) handleIncomingMessages(conn *clientConn) {
 			s.logger.Panicln(err)
 		}
 
-		buf.Reset()
-		s.inv.Send(x.Elem())
+		reflect.ValueOf(s.inv).Send(x.Elem())
 	}
 
-	s.mu.Lock()
-	for i := range s.connections {
-		if s.connections[i] == conn {
-			s.connections = append(s.connections[:i], s.connections[i+1:]...)
-			break
-		}
-	}
-	s.mu.Unlock()
-}
-
-func (s *Server) currentConn() *clientConn {
-	return s.connections[s.i]
-}
-
-func (s *Server) increment() {
-	s.i += 1
-	if s.i >= len(s.connections) {
-		s.i = 0
+	if buf.Cap() <= 1<<22 {
+		putBuffer(buf)
 	}
 }
 
 func (s *Server) handleOutgoingMessages() {
-	s.WaitUntilReady()
+	var (
+		buf = getBuffer()
+		enc = gob.NewEncoder(&buf)
+	)
 
 	for {
-		x, ok := s.outv.Recv()
+		x, ok := reflect.ValueOf(s.outv).Recv()
 		if !ok {
 			break
 		}
 
-		for {
-			s.mu.RLock()
-			if len(s.connections) == 0 {
-				s.mu.RUnlock()
-				s.WaitUntilReady()
-				s.mu.RLock()
+		buf.Reset()
+
+		if err := enc.EncodeValue(x); err != nil {
+			s.logger.Println(err)
+			continue
+		}
+
+		bb := make([]byte, 0, buf.Len()) // for use in goroutines
+		copy(bb, buf.Bytes())
+
+		for _, encoder := range s.encoders {
+			bb = encoder(bb)
+		}
+
+		seen := make(map[net.Conn]bool)
+
+		for i := int32(0); i < atomic.LoadInt32(&s.conncnt); i++ {
+			select {
+			case <-s.closed:
+				break
+			case c := <-s.chbroad:
+				if _, ok := seen[c]; !ok {
+					seen[c] = true
+					go func(cn net.Conn, bts []byte) {
+						if err := writeChunk(cn, bts); err != nil {
+							s.logger.Println(err)
+						}
+					}(c, bb)
+				}
 			}
-
-			if s.currentConn().enc == nil {
-				s.currentConn().enc = gob.NewEncoder(s.currentConn().buf)
-			}
-
-			if err := s.currentConn().enc.EncodeValue(x); err != nil {
-				s.logger.Println(err)
-
-				s.mu.RUnlock()
-				s.mu.Lock()
-				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
-				s.increment()
-				s.mu.Unlock()
-				s.mu.RLock()
-				continue
-			}
-
-			b := s.currentConn().buf.Bytes()
-			s.currentConn().buf.Reset()
-
-			for _, encoder := range s.encoders {
-				b = encoder(b)
-			}
-
-			if err := writeChunk(s.currentConn().c, b); err != nil {
-				s.logger.Println(err)
-
-				s.mu.RUnlock()
-				s.mu.Lock()
-				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
-				s.increment()
-				s.mu.Unlock()
-				s.mu.RLock()
-				continue
-			}
-
-			s.mu.RUnlock()
-			s.mu.Lock()
-			s.increment()
-			s.mu.Unlock()
-			break
 		}
 	}
 
@@ -343,7 +359,7 @@ func (c *Client) Logger() *log.Logger {
 
 func (c *Client) handleIncomingMessages() {
 	var (
-		buf bytes.Buffer
+		buf = getBuffer()
 		// The gob decoder uses a buffer because its underlying reader
 		// can't change without running into an "unknown type id" error.
 		dec = gob.NewDecoder(&buf)
@@ -393,7 +409,7 @@ func (c *Client) handleIncomingMessages() {
 
 func (c *Client) handleOutgoingMessages() {
 	var (
-		buf bytes.Buffer
+		buf = getBuffer()
 		enc = gob.NewEncoder(&buf)
 	)
 
