@@ -79,7 +79,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 func main() {
