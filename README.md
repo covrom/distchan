@@ -1,6 +1,7 @@
 # distchan
 
 Package distchan enables Go channels to be used for distributed computation.
+Improved stable version by covrom.
 
 ## Why?
 
