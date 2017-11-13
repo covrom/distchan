@@ -33,7 +33,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 func main() {
