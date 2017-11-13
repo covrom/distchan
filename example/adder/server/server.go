@@ -11,7 +11,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 type AdderInput struct {
@@ -69,7 +69,7 @@ func main() {
 		panic(err)
 	}
 
-	server := distchan.NewServer(ln, out, in)
+	server,_ := distchan.NewServer(ln, out, in)
 	server.Start()
 
 	fmt.Println("waiting for clients to connect...")

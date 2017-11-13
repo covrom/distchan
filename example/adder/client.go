@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 type AdderInput struct {
@@ -40,7 +40,8 @@ func main() {
 		panic(err)
 	}
 
-	distchan.NewClient(conn, out, in).Start()
+	cli, _ := distchan.NewClient(conn, out, in)
+	cli.Start()
 
 	fmt.Println("waiting for input...")
 	for input := range in {

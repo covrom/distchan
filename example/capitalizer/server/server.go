@@ -4,7 +4,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/dradtke/distchan"
+	"github.com/covrom/distchan"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 	var (
 		out    = make(chan string)
 		in     = make(chan string)
-		server = distchan.NewServer(ln, out, in)
+		server,_ = distchan.NewServer(ln, out, in)
 	)
 
 	server.Start()
